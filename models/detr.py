@@ -1,12 +1,15 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
+
 
 
 from .backbone import build_backbone          # CNN Backbone作成用
 from .transformer import build_transformer    # Transformer作成用
 from .matcher import build_matcher            # ハンガリアン法の作成用
 
-from util.misc import NestedTensor, nested_tensor_from_tensor_list
+from util.misc import NestedTensor, nested_tensor_from_tensor_list, is_dist_avail_and_initialized
+from util.misc import get_world_size, accuracy
 
 
 
@@ -78,10 +81,23 @@ class DETR(nn.Module):
         outputs_coord = self.bbox_embed(hs).sigmoid()
 
         ## 形状確認
-        print("output_coord.shape: ", outputs_coord.shape)
+        # print("output_coord.shape: ", outputs_coord.shape)   # output_coord.shape:  torch.Size([6, 7, 100, 4])
+
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+        # print("self.aux_loss: ", self.aux_loss)     # self.aux_loss:  True
+        if self.aux_loss:
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+        
+        return out
 
 
-        raise ValueError(f"not implemented")
+    
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_class, outputs_coord):
+        
+        return [{'pred_logits': a, 'pred_boxes': b}
+                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
 
 
@@ -127,6 +143,173 @@ class SetCriterion(nn.Module):
         empty_weight[-1] = self.eos_coef
         self.register_buffer('empty_weight', empty_weight)
 
+    ## 108
+    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
+
+        ## クラス分類損失の計算
+        assert 'pred_logits' in outputs
+        src_logits = outputs['pred_logits']
+        # print("src_logits.shape: ", src_logits.shape)   # src_logits.shape:  torch.Size([7, 100, 92])
+        # raise ValueError(f"not implemented")
+
+        ## (バッチ内の何番目のデータか，何番目のオブジェクトクエリの出力がラベルと対応しているか)を表すタプルを格納
+        idx = self._get_src_permutation_idx(indices)
+        # print("idx: ", idx)
+        # """
+        # idx:  (tensor([0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4,
+        # 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6]), tensor([80, 92,  9, 19, 31, 81,  5, 26, 31, 33, 35, 36, 46, 60, 63,  7, 37, 53,
+        # 57, 62, 69, 76, 87,  8, 54, 67, 73, 81, 85, 94,  6, 14, 29, 43, 63, 84,
+        #  2,  7, 17, 43]))
+        # """
+        # raise ValueError(f"not implemented")
+
+
+        ## 形状確認（ハンガリアン法の結果の再確認）
+        # print("len(indices): ", len(indices))    # len(indices):  7
+        # print("indices[0]: ", indices[0])        # indices[0]:  (tensor([80, 92]), tensor([0, 1]))
+        # print("indices[1]: ", indices[1])        # indices[1]:  (tensor([ 9, 19, 31, 81]), tensor([2, 1, 0, 3]))
+
+        
+        ## ラベルの獲得
+        target_classes_o = torch.cat([t["labels"][j] for t, (_, j) in zip(targets, indices)])
+        # print("target_classes_o: ", target_classes_o)
+        # """
+        # target_classes_o:  tensor([82, 79, 34,  1,  1,  1,  6,  6,  6,  6,  6,  6,  6,  6,  6, 82, 47, 81,
+        # 44, 47, 79, 78, 51, 84, 74, 84, 76, 72, 72, 74,  1,  1,  1,  1,  1,  4,
+        # 67, 51, 59, 48], device='cuda:0')
+        # """
+
+        ## オブジェクトクエリの出力用ラベルの雛形を作成（全て背景で埋める）
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
+                                    dtype=torch.int64, device=src_logits.device)
+        # print("target_classes: ", target_classes)
+
+        ## 出力に対応した位置のラベルを背景から物体のラベルに変更
+        ## （print(target_classes)で表示するとわかりやすい）
+        target_classes[idx] = target_classes_o
+        # print("target_classes: ", target_classes)
+
+
+        # for t, (_, j) in zip(targets, indices):
+
+        #     print('t["labels"][j]: ', t["labels"][j])
+        #     """
+        #     t["labels"][j]:  tensor([82, 79], device='cuda:0')
+        #     t["labels"][j]:  tensor([34,  1,  1,  1], device='cuda:0')
+        #     t["labels"][j]:  tensor([6, 6, 6, 6, 6, 6, 6, 6, 6], device='cuda:0')
+        #     t["labels"][j]:  tensor([82, 47, 81, 44, 47, 79, 78, 51], device='cuda:0')
+        #     t["labels"][j]:  tensor([84, 74, 84, 76, 72, 72, 74], device='cuda:0')
+        #     t["labels"][j]:  tensor([1, 1, 1, 1, 1, 4], device='cuda:0')
+        #     t["labels"][j]:  tensor([67, 51, 59, 48], device='cuda:0')
+        #     """
+
+
+        ## 分類損失の計算
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        losses = {'loss_ce': loss_ce}
+        # print("loss_ce: ", loss_ce)     # loss_ce:  tensor(5.0847, device='cuda:0', grad_fn=<NllLoss2DBackward0>)
+
+        ## 記録
+        if log:
+            # TODO this should probably be a separate loss, not hacked in this one here
+            losses['class_error'] = 100 - accuracy(src_logits[idx], target_classes_o)[0]
+            # print("losses['class_error']: ", losses['class_error'])    # losses['class_error']:  tensor(100., device='cuda:0')
+
+        return losses
+
+        
+    
+
+    def loss_cardinality(self, outputs, targets, indices, num_boxes):
+
+        pred_logits = outputs['pred_logits']
+        device = pred_logits.device
+
+        raise ValueError(f"not implemented")
+
+
+
+    ## 193
+    def _get_src_permutation_idx(self, indices):
+
+        ## インデックスに従って予測を並び替える
+        batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])   # バッチ内の何番目のデータかを表すインデックスを格納
+        src_idx = torch.cat([src for (src, _) in indices])                                       # 何番目のオブジェクトクエリの出力がラベルに対応した出力かを格納
+
+        # print("batch_idx: ", batch_idx)
+        # """
+        # batch_idx:  tensor([0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4,
+        # 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6])
+        # """
+
+        # print("src_ix: ", src_idx)
+        # """
+        # src_ix:  tensor([80, 92,  9, 19, 31, 81,  5, 26, 31, 33, 35, 36, 46, 60, 63,  7, 37, 53,
+        # 57, 62, 69, 76, 87,  8, 54, 67, 73, 81, 85, 94,  6, 14, 29, 43, 63, 84,
+        #  2,  7, 17, 43])
+        # """
+        # raise ValueError(f"not implemented")
+
+        return batch_idx, src_idx
+
+
+
+
+
+
+    ## 205
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+
+        loss_map = {
+            'labels': self.loss_labels,
+            'cardinality': self.loss_cardinality,
+            # 'boxes': self.loss_boxes,
+            # 'masks': self.loss_masks
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def forward(self, outputs, targets):
+
+        ## 形状確認
+        # print("len(outputs): ", len(outputs))    # len(outputs):  3
+        # print("len(targets): ", len(targets))    # len(targets):  7
+
+
+        ## aux_outputsを取り除く
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
+
+        ## ハンガリアン法によって出力とラベルの一致を決定
+        indices = self.matcher(outputs_without_aux, targets)
+
+        ## 形状確認
+        # print("len(indices): ", len(indices))    # len(indices):  7
+        # print("indices[0]: ", indices[0])        # indices[0]:  (tensor([80, 92]), tensor([0, 1]))
+        # print("indices[1]: ", indices[1])        # indices[1]:  (tensor([ 9, 19, 31, 81]), tensor([2, 1, 0, 3]))
+
+        ## 3.1節最後の文章の正規化
+        ## ボックスの数を獲得
+        num_boxes = sum(len(t["labels"]) for t in targets)
+        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
+        if is_dist_avail_and_initialized():
+            torch.distributed.all_reduce(num_boxes)
+        num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+
+        # print("num_boxes: ", num_boxes)     # num_boxes:  40.0
+
+
+        ## 損失の計算
+        losses = {}
+        for loss in self.losses:
+            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes))
+        
+
+
+
+        
+
+        raise ValueError(f"not implemented")
+
 
 ## 289
 class MLP(nn.Module):
@@ -146,7 +329,10 @@ class MLP(nn.Module):
     
     def forward(self, x):
 
-        print(self)
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        
+        return x
 
 
 ## 304

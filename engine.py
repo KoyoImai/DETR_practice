@@ -54,5 +54,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         ## modelにデータを入力
         outputs = model(samples)
 
-        print(hjkl)
+        ## 損失の計算
+        loss_dict = criterion(outputs, targets)
+
+        raise ValueError(f"not implemented")
 
